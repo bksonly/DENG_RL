@@ -92,7 +92,7 @@ DENG_RL/
 - 输入：critic_state [B, 6, 4, 15] + global_feats [B, 5]
 - CNN backbone：独立处理6通道状态（包含对手手牌）
 - MLP：处理全局特征
-- LSTM：融合特征并建模历史
+- 前馈结构：Critic 输入已马尔可夫（全局可见），不使用 LSTM，而是在融合特征上直接预测 value
 - 输出：价值估计 [B]
 
 ### 设计说明
@@ -106,31 +106,33 @@ DENG_RL/
 
 ### 混合对手策略
 
-每个环境随机分配以下5种策略之一（各20%概率）：
+训练时，每个环境随机分配以下 4 种策略之一作为对手（概率大致为 greedy≈40%、ep100≈20%、ep50_before≈20%、random≈20%，具体数量根据 `NUM_ENVS` 取整，并将余数加到 greedy 或 random 上）。  
+在实验中发现，idiot 的分布与其他对手差异过大，会导致训练不稳定，因此在训练对手池中剔除了 idiot，将其原本约 5% 的份额并入 greedy。
 
-1. 贪心策略：使用简单贪心算法
-2. 当前策略：使用正在训练的模型
-3. 第100个epoch checkpoint
-4. 当前进度前100个checkpoint
-5. 随机历史checkpoint
+1. 贪心策略（greedy）：使用改进后的“菜鸟”贪心（尽量出长顺子、避免过早掏2/对2）
+2. idiot 策略（仅用于评估曲线对比，不参与训练混合对手）：白痴贪心，总是出枚举到的第一个合法非 PASS 动作（通常是最小单牌）
+3. 第100个epoch checkpoint（ep100）：固定使用第100个 episode 存下的策略；若该 checkpoint 尚不存在，则回退为 greedy
+4. 当前进度前一个“50 区间”的 checkpoint（ep50_before）：从 150 epoch 开始启用，例如 150–199 epoch 使用 ep100，200–249 epoch 使用 ep150；若对应 checkpoint 尚不存在，则回退为 greedy
+5. 随机选取一个历史checkpoint（仅从已存在且 episode≥100 的 checkpoint 中随机采样；若不存在，则回退为 greedy）
 
 ### 训练配置
 
-- 并行环境数：20
-- Rollout steps：1024
+- 训练用并行环境数（`NUM_ENVS`）：100（额外约 10% 的环境只用于 vs idiot 评估，不参与训练更新）
+- Rollout steps（`ROLLOUT_STEPS`）：256
 - PPO epochs：4
 - Batch size：512
-- 学习率：1e-4
+- 学习率：1e-5
 - 最大训练episode：1000
 - Checkpoint间隔：每50个episode
 
 ### 评估指标
 
-从训练过程中自动统计三种评估指标：
+从训练过程中自动统计多种评估指标：
 
-1. vs 贪心策略：统计与贪心对手对战的reward
-2. vs 第100个epoch checkpoint：统计与历史强对手对战的reward
-3. vs 当前前100个checkpoint：统计与近期对手对战的reward
+1. vs 贪心策略（greedy）：统计与改进菜鸟对手对战的reward
+2. vs idiot 策略：统计与白痴贪心对手对战的reward（注意：idiot 仅作为评估基线，不参与训练时的混合对手）
+3. vs 第100个epoch checkpoint：统计与第100个episode模型对战的reward
+4. vs 当前前一个“50 区间”的 checkpoint（从150开始）：统计与“当前进度前一个 50 区间 checkpoint”模型对战的reward
 
 
 ### 恢复训练

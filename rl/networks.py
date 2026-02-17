@@ -141,14 +141,15 @@ class Critic(nn.Module):
       - global_dim: 全局特征维度（默认为 5）
       - global_hidden_dim: 全局特征 MLP 输出维度
 
+    说明：
+      - Critic 输入信息已满足马尔可夫性（全局可见），不依赖历史，因此不使用 LSTM。
+
     输入：
       - critic_state: [B, 6, 4, 15] - Critic的状态（能看到所有手牌）
       - global_feats: [B, global_dim]
-      - hidden: (h_critic, c_critic) or None，形状 [num_layers, B, hidden_size]
-    
+
     返回：
       - value: [B]
-      - new_hidden: (h_critic, c_critic)
     """
 
     def __init__(
@@ -186,29 +187,19 @@ class Critic(nn.Module):
             nn.Linear(global_dim, global_hidden_dim),
             nn.ReLU(),
         )
-
-        # Critic的LSTM记忆模块
-        lstm_input_size = hidden_size + global_hidden_dim
-        self.critic_lstm = nn.LSTM(
-            input_size=lstm_input_size,
-            hidden_size=hidden_size,
-            num_layers=1,
-        )
-
-        # Critic 头
-        self.critic_head = nn.Linear(hidden_size, 1)
+        
+        # Critic 头（不使用 LSTM，直接在融合特征上预测 value）
+        self.critic_head = nn.Linear(hidden_size + global_hidden_dim, 1)
 
     def forward(
         self,
         critic_state: torch.Tensor,
         global_feats: torch.Tensor,
-        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+    ) -> torch.Tensor:
         """
         critic_state: [B, 6, 4, 15] - Critic的状态（能看到所有手牌）
         global_feats: [B, global_dim]
-        hidden: (h_critic, c_critic) or None
-        返回：value, new_hidden
+        返回：value
         """
         B = critic_state.size(0)
 
@@ -219,28 +210,8 @@ class Critic(nn.Module):
 
         # 全局特征
         g = self.global_mlp(global_feats)  # [B, G]
-
-        # Critic: 拼接后送入 LSTM
-        critic_x = torch.cat([critic_x, g], dim=-1)  # [B, H+G]
-        critic_x = critic_x.unsqueeze(0)  # [1, B, H+G]
-
-        # 处理hidden state
-        if hidden is None:
-            h_critic = torch.zeros(1, B, self.critic_lstm.hidden_size, device=critic_state.device)
-            c_critic = torch.zeros(1, B, self.critic_lstm.hidden_size, device=critic_state.device)
-            hidden = (h_critic, c_critic)
-        else:
-            h_critic, c_critic = hidden
-
-        # Critic LSTM
-        critic_lstm_out, (new_h_critic, new_c_critic) = self.critic_lstm(
-            critic_x, (h_critic, c_critic)
-        )  # [1, B, H]
-        critic_lstm_out = critic_lstm_out.squeeze(0)  # [B, H]
-
-        value = self.critic_head(critic_lstm_out).squeeze(-1)  # [B]
-
-        new_hidden = (new_h_critic, new_c_critic)
-
-        return value, new_hidden
+        
+        critic_feat = torch.cat([critic_x, g], dim=-1)  # [B, H+G]
+        value = self.critic_head(critic_feat).squeeze(-1)  # [B]
+        return value
 

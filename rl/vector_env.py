@@ -33,7 +33,12 @@ class VectorEnv:
         for env_idx in range(num_envs):
             opp_agent = self.opponent_agents[env_idx]
             opp_hidden = self.opponent_hidden_states[env_idx] if self.opponent_hidden_states is not None else None
-            env = GanDengYanEnv(opponent_agent=opp_agent, opponent_hidden_states=opp_hidden)
+            strategy_type = self.opponent_strategy_types[env_idx]
+            env = GanDengYanEnv(
+                opponent_agent=opp_agent,
+                opponent_hidden_states=opp_hidden,
+                opponent_strategy_type=strategy_type,
+            )
             self.envs.append(env)
     
     def set_opponent_agents(self, opponent_agents: List, opponent_strategy_types: List[str]):
@@ -47,6 +52,8 @@ class VectorEnv:
         for env_idx, env in enumerate(self.envs):
             if self.opponent_hidden_states is not None:
                 env.opponent_hidden_states = self.opponent_hidden_states[env_idx]
+            # 更新每个环境的对手策略类型（仅在使用固定策略时生效）
+            env.opponent_strategy_type = self.opponent_strategy_types[env_idx]
 
     def reset(self) -> np.ndarray:
         states = [env.reset() for env in self.envs]
@@ -63,6 +70,10 @@ class VectorEnv:
             s, r, d, info = env.step(a)
             if d:
                 # 若终局（包括废局），立即 reset
+                # 同时清理对手的 RNN hidden state，避免跨局泄漏记忆
+                if self.opponent_hidden_states is not None:
+                    for i in range(len(self.opponent_hidden_states[env_idx])):
+                        self.opponent_hidden_states[env_idx][i] = None
                 s = env.reset()
             next_states.append(s)
             rewards.append(r)

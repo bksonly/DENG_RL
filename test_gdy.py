@@ -160,28 +160,15 @@ class DebugEnv(GanDengYanEnv):
 
 def greedy_action_for_player(env: GanDengYanEnv, pid: int) -> int:
     """
-    为指定玩家 pid 选择动作（贪心策略）：
-      - 找到第一个合法的非 PASS 动作；
-      - 没有可出的牌时则 PASS。
+    为指定玩家 pid 选择动作（“菜鸟式”贪心策略）：
+      - 接牌时优先打小牌，尽量不用炸弹；
+      - 首出时在合法动作里（排除炸弹）取“最后一个”动作，
+        也就是更倾向于先打顺子、再打对子，最后才是单牌。
+      - 若没有任何非炸弹解，则在炸弹中选一个代价最小的炸弹；
+      - 若连炸弹也没有，则 PASS（如果规则允许）。
     """
-    hand = env._hand_counts(pid)
-    # must_play 对所有玩家生效：若当前为“摸牌后首出”，则禁止过牌
-    legal = env.get_legal_actions(
-        hand,
-        env.last_move_pattern,
-        env.last_move_cards,
-        must_play=env.must_play,
-    )
-
-    # 默认 PASS（通常是 actions[0]）
-    action_idx = 0
-    for idx, pat in enumerate(env.actions):
-        if not legal[idx]:
-            continue
-        if pat.type != "pass":
-            action_idx = idx
-            break
-    return action_idx
+    # 直接复用环境内部的贪心逻辑，保证与训练时的一致性
+    return env._select_greedy_action_index(pid)
 
 
 def run_one_game(seed: Optional[int] = 1233):
@@ -242,5 +229,5 @@ def run_one_game(seed: Optional[int] = 1233):
 
 if __name__ == "__main__":
     # 你可以修改 seed 或改成 None 看更多不同局面
-    run_one_game(seed=3)
+    run_one_game(seed=4)
 

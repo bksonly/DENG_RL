@@ -30,14 +30,24 @@ class GanDengYanEnv:
     - step: 从“我出牌”到下一次轮到“我出牌”或本局结束。
     """
 
-    def __init__(self, num_players: int = 4, seed: Optional[int] = None, opponent_agent=None, opponent_hidden_states=None):
+    def __init__(
+        self,
+        num_players: int = 4,
+        seed: Optional[int] = None,
+        opponent_agent=None,
+        opponent_hidden_states=None,
+        opponent_strategy_type: str = "greedy",
+    ):
         assert num_players == 4, "当前实现仅支持 4 人局"
         self.num_players = num_players
         self.rng = random.Random(seed)
         
-        # 对手策略：None 表示贪心，否则使用 PPO agent
+        # 对手策略：
+        # - opponent_agent 为 None 时，根据 opponent_strategy_type 选择贪心/idiot 等固定策略；
+        # - opponent_agent 不为 None 时，使用 PPO policy。
         self.opponent_agent = opponent_agent
         self.opponent_hidden_states = opponent_hidden_states  # List[hidden_state or None] for each opponent
+        self.opponent_strategy_type = opponent_strategy_type
 
         # 下一局的庄家（用于实现赢家连庄规则）
         self.next_dealer: Optional[int] = None
@@ -230,6 +240,185 @@ class GanDengYanEnv:
                 mask[idx] = True
         
         return mask
+
+    # ===== 贪心策略（供对手与调试脚本复用） =====
+
+    def _select_greedy_action_index(self, pid: int) -> int:
+        """
+        为指定玩家 pid 选择一个“菜鸟式”贪心动作：
+        - 接牌时：优先打小牌，尽量不用炸弹（只有没有其它选择时才考虑炸弹）；
+          例如上家打4，我更倾向于打5，而不是直接掏2或炸弹。
+        - 首出时：在所有合法动作中，忽略炸弹，取“最后一个”非炸弹动作，尽量不先出2或2对。
+         （结合当前枚举顺序，相当于优先出最长的顺子，其次对子，最后单牌）。
+        - 若没有任何可出的非炸弹动作，则在炸弹中选择“代价最小”的一个；
+          若连炸弹也没有，则只能 PASS（如果规则允许）。
+        """
+        hand = self._hand_counts(pid)
+        legal_mask = self.get_legal_actions(
+            hand, self.last_move_pattern, self.last_move_cards, must_play=self.must_play
+        )
+
+        # 找到 pass 的索引（若存在）
+        pass_idx = self._find_action_index(ActionPattern(type="pass"))
+        can_pass = (
+            pass_idx is not None
+            and pass_idx < len(legal_mask)
+            and bool(legal_mask[pass_idx])
+        )
+
+        # 根据是否有上家动作，枚举候选牌型
+        if self.last_move_pattern is not None:
+            # 接牌：只枚举能管住的动作
+            legal_patterns = enumerate_legal_responses(
+                hand, self.last_move_pattern, self.last_move_cards
+            )
+        else:
+            # 首出：基于手牌枚举所有可能动作
+            legal_patterns = enumerate_legal_first_moves(hand)
+
+        candidates = []
+        for pat in legal_patterns:
+            idx = self._find_action_index(pat)
+            if idx is None:
+                continue
+            if idx >= len(legal_mask) or not legal_mask[idx]:
+                continue
+            candidates.append((pat, idx))
+
+        # 如果没有任何可出的动作（理论上不太可能），则 PASS 或 0 号动作兜底
+        if not candidates:
+            if can_pass:
+                return pass_idx  # type: ignore[arg-type]
+            return 0
+
+        # ===== 情况一：接牌，优先打小牌，尽量不用炸弹 =====
+        if self.last_move_pattern is not None:
+            non_bombs = [(pat, idx) for pat, idx in candidates if pat.type != "bomb"]
+
+            # 有非炸弹解时，只在这些解里选“最小”的一手
+            if non_bombs:
+                def key_non_bomb(item):
+                    pat, _ = item
+                    if pat.type in ("single", "pair", "bomb"):
+                        rank = pat.rank if pat.rank is not None else 0
+                        length = pat.length if pat.length is not None else 0
+                        # 单张 / 对子：以点数为主，长度次之
+                        return (rank, length)
+                    elif pat.type == "straight":
+                        start = pat.start_rank if pat.start_rank is not None else 0
+                        length = pat.length if pat.length is not None else 0
+                        # 顺子：先比较起始点数，再比较长度
+                        return (start, length)
+                    # 其它类型暂不使用
+                    return (0, 0)
+
+                _, best_idx = min(non_bombs, key=key_non_bomb)
+                return best_idx
+
+            # 只有炸弹可用时，在炸弹中选择“最轻微”的一个
+            bombs = [(pat, idx) for pat, idx in candidates if pat.type == "bomb"]
+            if bombs:
+                def key_bomb(item):
+                    pat, _ = item
+                    length = pat.length if pat.length is not None else 0
+                    rank = pat.rank if pat.rank is not None else 0
+                    # 先比较长度，再比较点数：越短、点数越小越优先
+                    return (length, rank)
+
+                _, best_idx = min(bombs, key=key_bomb)
+                return best_idx
+
+            # 理论上不会走到这里（candidates 非空且不是炸弹非炸弹的组合），兜底 PASS
+            if can_pass:
+                return pass_idx  # type: ignore[arg-type]
+            return 0
+
+        # ===== 情况二：首出，在合法非炸弹动作中取“最后一个” =====
+        non_bombs = [(pat, idx) for pat, idx in candidates if pat.type != "bomb"]
+        if non_bombs:
+            # 先尝试在非炸弹动作中排除“2”和“对2”，这样不会无脑先掏2或2对。
+            filtered = [
+                (pat, idx)
+                for pat, idx in non_bombs
+                if not (pat.type in ("single", "pair") and pat.rank == RANK_2)
+            ]
+
+            if filtered:
+                # 若排除 2/对2 后仍有候选，按当前枚举顺序取最后一个：
+                #   - 顺子中最长的组合
+                #   - 若没有顺子，则是较大的对子
+                #   - 最后才是较大的单张
+                _, best_idx = filtered[-1]
+            else:
+                # 如果把 2 和对2 排掉之后一个都不剩，就退回到原非炸弹列表，
+                # 仍然取最后一个（哪怕是 2 或对2），避免无牌可出。
+                _, best_idx = non_bombs[-1]
+            return best_idx
+
+        # 只有炸弹：选一个“最轻微”的炸弹（长度短、点数小）
+        bombs = [(pat, idx) for pat, idx in candidates if pat.type == "bomb"]
+        if bombs:
+            def key_bomb_first(item):
+                pat, _ = item
+                length = pat.length if pat.length is not None else 0
+                rank = pat.rank if pat.rank is not None else 0
+                return (length, rank)
+
+            _, best_idx = min(bombs, key=key_bomb_first)
+            return best_idx
+
+        # 理论兜底：没有候选但规则允许 PASS
+        if can_pass:
+            return pass_idx  # type: ignore[arg-type]
+        return 0
+
+    def _select_idiot_action_index(self, pid: int) -> int:
+        """
+        为指定玩家 pid 选择动作（\"idiot\" 白痴策略）：
+        - 行为等同于旧版简单贪心：
+          - 在合法动作中按枚举顺序找到第一个非 PASS 动作；
+          - 若没有非 PASS 动作且允许 PASS，则 PASS；
+          - 否则退化为动作 0。
+        - 这样一般会优先出最小的单牌，其次最小的对子/顺子。
+        """
+        hand = self._hand_counts(pid)
+        legal_mask = self.get_legal_actions(
+            hand, self.last_move_pattern, self.last_move_cards, must_play=self.must_play
+        )
+
+        # PASS 的索引
+        pass_idx = self._find_action_index(ActionPattern(type="pass"))
+        can_pass = (
+            pass_idx is not None
+            and pass_idx < len(legal_mask)
+            and bool(legal_mask[pass_idx])
+        )
+
+        # 按之前贪心逻辑的方式枚举候选牌型
+        if self.last_move_pattern is not None:
+            legal_patterns = enumerate_legal_responses(
+                hand, self.last_move_pattern, self.last_move_cards
+            )
+        else:
+            legal_patterns = enumerate_legal_first_moves(hand)
+
+        # 找到第一个合法的非 PASS 动作
+        for pat in legal_patterns:
+            if pat.type == "pass":
+                continue
+            idx = self._find_action_index(pat)
+            if idx is None:
+                continue
+            if idx >= len(legal_mask) or not legal_mask[idx]:
+                continue
+            return idx
+
+        # 没有非 PASS，尝试 PASS
+        if can_pass:
+            return pass_idx  # type: ignore[arg-type]
+
+        # 兜底：直接返回0号动作
+        return 0
 
     # ===== 观测编码 =====
 
@@ -472,24 +661,13 @@ class GanDengYanEnv:
             pat = self.actions[action_idx]
             self._apply_action(pid, pat)
         else:
-            # 贪心策略：使用枚举函数找到第一个合法的非pass动作
-            hand = self._hand_counts(pid)
-            if self.last_move_pattern is not None:
-                legal_patterns = enumerate_legal_responses(
-                    hand, self.last_move_pattern, self.last_move_cards
-                )
+            # 固定策略：根据 opponent_strategy_type 选择具体规则
+            strategy = getattr(self, "opponent_strategy_type", "greedy")
+            if strategy == "idiot":
+                action_idx = self._select_idiot_action_index(pid)
             else:
-                legal_patterns = enumerate_legal_first_moves(hand)
-            
-            # 策略：找到第一个合法的非 pass 动作；若没有，则 pass
-            action_idx = 0  # 默认 pass
-            for pat in legal_patterns:
-                if pat.type != "pass":
-                    idx = self._find_action_index(pat)
-                    if idx is not None:
-                        action_idx = idx
-                        break
-            
+                # 默认使用改进后的“菜鸟式”贪心
+                action_idx = self._select_greedy_action_index(pid)
             pat = self.actions[action_idx]
             self._apply_action(pid, pat)
 
