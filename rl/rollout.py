@@ -7,7 +7,7 @@ from typing import List, Dict, Any, Tuple
 import numpy as np
 import torch
 
-from env.encoding import build_global_features
+from env.encoding import build_global_features, build_state, build_state_for_critic
 from .ppo_agent import PPOAgent, compute_gae
 from .vector_env import VectorEnv
 
@@ -15,7 +15,7 @@ from .vector_env import VectorEnv
 def collect_rollout(
     vec_env: VectorEnv,
     agent: PPOAgent,
-    hidden_states: List[Tuple[torch.Tensor, torch.Tensor] or None],
+    hidden_states: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] or None],
     rollout_steps: int,
     gamma: float,
     gae_lambda: float,
@@ -26,7 +26,8 @@ def collect_rollout(
     """
     states = vec_env.reset()
 
-    obs_buf = []
+    actor_states_buf = []
+    critic_states_buf = []
     actions_buf = []
     log_probs_buf = []
     rewards_buf = []
@@ -41,9 +42,38 @@ def collect_rollout(
         batch_values: List[float] = []
         batch_legal_masks: List[np.ndarray] = []
         batch_global_feats: List[np.ndarray] = []
+        batch_actor_states: List[np.ndarray] = []
+        batch_critic_states: List[np.ndarray] = []
 
         for env_idx, env in enumerate(vec_env.envs):
-            state = states[env_idx]
+            state = states[env_idx]  # 这是从env返回的状态，目前是3通道的actor状态
+            
+            # 构建actor状态（3通道：自己的手牌、墓地、目标牌）
+            actor_state = build_state(
+                agent_id=env.agent_id,
+                hands=env.hands,
+                num_players=env.num_players,
+                graveyard=env.graveyard,
+                last_move_cards=env.last_move_cards,
+                last_move_player=env.last_move_player,
+                current_player=env.current_player,
+                must_play=env.must_play,
+                has_active_last_move=env.last_move_pattern is not None,
+            )
+            
+            # 构建critic状态（6通道：自己的手牌、3个对手手牌、墓地、目标牌）
+            critic_state = build_state_for_critic(
+                agent_id=env.agent_id,
+                hands=env.hands,
+                num_players=env.num_players,
+                graveyard=env.graveyard,
+                last_move_cards=env.last_move_cards,
+                last_move_player=env.last_move_player,
+                current_player=env.current_player,
+                must_play=env.must_play,
+                has_active_last_move=env.last_move_pattern is not None,
+            )
+            
             # 计算当前合法动作 mask
             hand = env._hand_counts(env.agent_id)
             legal_mask = env.get_legal_actions(
@@ -61,7 +91,7 @@ def collect_rollout(
             )
 
             action, log_prob, value, new_hidden = agent.select_action(
-                state, global_feats, legal_mask, hidden_states[env_idx]
+                actor_state, critic_state, global_feats, legal_mask, hidden_states[env_idx]
             )
             hidden_states[env_idx] = new_hidden
 
@@ -70,10 +100,13 @@ def collect_rollout(
             batch_values.append(value)
             batch_legal_masks.append(legal_mask)
             batch_global_feats.append(global_feats)
+            batch_actor_states.append(actor_state)
+            batch_critic_states.append(critic_state)
 
         next_states, rewards, dones, infos = vec_env.step(batch_actions)
 
-        obs_buf.append(states.copy())
+        actor_states_buf.append(np.stack(batch_actor_states, axis=0))
+        critic_states_buf.append(np.stack(batch_critic_states, axis=0))
         actions_buf.append(np.array(batch_actions, dtype=np.int64))
         log_probs_buf.append(np.array(batch_log_probs, dtype=np.float32))
         rewards_buf.append(rewards.copy())
@@ -87,7 +120,18 @@ def collect_rollout(
     # 最后一个 step 的 value 用于 GAE
     last_values: List[float] = []
     for env_idx, env in enumerate(vec_env.envs):
-        state = states[env_idx]
+        # 构建最后一个step的critic状态（只需要critic，不需要actor）
+        critic_state = build_state_for_critic(
+            agent_id=env.agent_id,
+            hands=env.hands,
+            num_players=env.num_players,
+            graveyard=env.graveyard,
+            last_move_cards=env.last_move_cards,
+            last_move_player=env.last_move_player,
+            current_player=env.current_player,
+            must_play=env.must_play,
+            has_active_last_move=env.last_move_pattern is not None,
+        )
         has_active_last_move = env.last_move_pattern is not None
         global_feats = build_global_features(
             agent_id=env.agent_id,
@@ -97,15 +141,25 @@ def collect_rollout(
             must_play=env.must_play,
             has_active_last_move=has_active_last_move,
         )
-        state_t = torch.from_numpy(state).float().unsqueeze(0).to(agent.device)
+        critic_state_t = torch.from_numpy(critic_state).float().unsqueeze(0).to(agent.device)
         global_feats_t = (
             torch.from_numpy(global_feats).float().unsqueeze(0).to(agent.device)
         )
-        _, value_t, _ = agent.net(state_t, global_feats_t, hidden_states[env_idx])
+        
+        # 只调用 critic，提取 critic 的 hidden state
+        hidden = hidden_states[env_idx]
+        critic_hidden = None
+        if hidden is not None:
+            # hidden 格式是 (h_actor, c_actor, h_critic, c_critic)
+            _, _, h_critic, c_critic = hidden
+            critic_hidden = (h_critic, c_critic)
+        
+        value_t, _ = agent.critic(critic_state_t, global_feats_t, critic_hidden)
         last_values.append(float(value_t.item()))
     last_values_arr = np.array(last_values, dtype=np.float32)
 
-    obs = np.stack(obs_buf, axis=0)  # [T, E, C_s, 4, 15]
+    actor_states = np.stack(actor_states_buf, axis=0)  # [T, E, 3, 4, 15]
+    critic_states = np.stack(critic_states_buf, axis=0)  # [T, E, 6, 4, 15]
     actions = np.stack(actions_buf, axis=0)  # [T, E]
     log_probs = np.stack(log_probs_buf, axis=0)  # [T, E]
     rewards = np.stack(rewards_buf, axis=0)  # [T, E]
@@ -119,7 +173,8 @@ def collect_rollout(
     # 打平成 [T*E, ...]
     T, E = rewards.shape
     N = T * E
-    obs_flat = obs.reshape(T * E, *obs.shape[2:])
+    actor_states_flat = actor_states.reshape(T * E, *actor_states.shape[2:])
+    critic_states_flat = critic_states.reshape(T * E, *critic_states.shape[2:])
     actions_flat = actions.reshape(N)
     log_probs_flat = log_probs.reshape(N)
     returns_flat = returns.reshape(N)
@@ -141,8 +196,12 @@ def collect_rollout(
         # 如果没有完成的游戏，返回 0
         mean_reward = 0.0
 
+    # 记录每个环境的对手策略类型（用于后续统计不同对手策略下的reward）
+    opponent_strategy_types = vec_env.opponent_strategy_types if hasattr(vec_env, 'opponent_strategy_types') else None
+
     batch = {
-        "states": torch.from_numpy(obs_flat).float(),
+        "actor_states": torch.from_numpy(actor_states_flat).float(),
+        "critic_states": torch.from_numpy(critic_states_flat).float(),
         "actions": torch.from_numpy(actions_flat).long(),
         "log_probs": torch.from_numpy(log_probs_flat).float(),
         "returns": torch.from_numpy(returns_flat).float(),
@@ -151,6 +210,9 @@ def collect_rollout(
         "global_feats": torch.from_numpy(global_feats_flat).float(),
         "mean_reward": mean_reward,
         "num_games_completed": num_games_completed,
+        "rewards": rewards,  # 保留原始rewards用于按对手策略类型统计
+        "dones": dones,  # 保留原始dones用于按对手策略类型统计
+        "opponent_strategy_types": opponent_strategy_types,  # 每个环境的对手策略类型
     }
 
     return batch

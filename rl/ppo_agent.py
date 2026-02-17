@@ -9,7 +9,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from .networks import ActorCritic
+from .networks import Actor, Critic
 
 
 class PPOAgent:
@@ -39,25 +39,36 @@ class PPOAgent:
         self.ppo_epochs = ppo_epochs
         self.batch_size = batch_size
 
-        # ActorCritic 同时接收空间状态和 5 维全局特征
-        self.net = ActorCritic(num_actions=num_actions, global_dim=5).to(self.device)
-        self.optimizer = optim.Adam(self.net.parameters(), lr=lr)
+        # 独立的 Actor 和 Critic 网络
+        self.actor = Actor(num_actions=num_actions, global_dim=5).to(self.device)
+        self.critic = Critic(global_dim=5).to(self.device)
+        
+        # 共享一个 optimizer 同时优化两个网络
+        params = list(self.actor.parameters()) + list(self.critic.parameters())
+        self.optimizer = optim.Adam(params, lr=lr)
 
     @torch.no_grad()
     def select_action(
         self,
-        state: np.ndarray,
+        actor_state: np.ndarray,
+        critic_state: np.ndarray,
         global_feats: np.ndarray,
         legal_mask: np.ndarray,
-        hidden: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    ) -> Tuple[int, float, float, Tuple[torch.Tensor, torch.Tensor]]:
+        hidden: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = None,
+        compute_value: bool = True,
+    ) -> Tuple[int, float, float, Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
         """
         根据当前状态、全局特征和合法动作 mask 选择动作。
+        actor_state: [3, 4, 15] - Actor的状态（只能看到自己的手牌）
+        critic_state: [6, 4, 15] - Critic的状态（能看到所有手牌）
+        hidden: (h_actor, c_actor, h_critic, c_critic) or None（当 compute_value=True 时）
+                或 (h_actor, c_actor) or None（当 compute_value=False 时）
+        compute_value: 是否计算 value（默认 True，保持向后兼容）
         返回：action, log_prob, value, new_hidden
         """
-        state_t = (
-            torch.from_numpy(state).float().unsqueeze(0).to(self.device)
-        )  # [1,C,4,15]
+        actor_state_t = (
+            torch.from_numpy(actor_state).float().unsqueeze(0).to(self.device)
+        )  # [1,3,4,15]
         global_feats_t = (
             torch.from_numpy(global_feats).float().unsqueeze(0).to(self.device)
         )  # [1,5]
@@ -67,7 +78,22 @@ class PPOAgent:
             .to(self.device)
         )  # [1,A]
 
-        logits, value, new_hidden = self.net(state_t, global_feats_t, hidden)
+        # 处理 hidden state
+        if hidden is None:
+            actor_hidden = None
+            critic_hidden = None
+        elif compute_value:
+            # 旧格式：4个tensor (h_actor, c_actor, h_critic, c_critic)
+            h_actor, c_actor, h_critic, c_critic = hidden
+            actor_hidden = (h_actor, c_actor)
+            critic_hidden = (h_critic, c_critic)
+        else:
+            # 新格式：2个tensor (h_actor, c_actor)
+            actor_hidden = hidden
+            critic_hidden = None
+
+        # 调用 Actor
+        logits, (new_h_actor, new_c_actor) = self.actor(actor_state_t, global_feats_t, actor_hidden)
 
         # 将非法动作 logits 置为 -1e9
         logits_masked = logits.clone()
@@ -78,19 +104,36 @@ class PPOAgent:
         action = dist.sample()
         log_prob = dist.log_prob(action)
 
-        return (
-            int(action.item()),
-            float(log_prob.item()),
-            float(value.item()),
-            new_hidden,
-        )
+        # 如果需要计算 value，调用 Critic
+        if compute_value:
+            critic_state_t = (
+                torch.from_numpy(critic_state).float().unsqueeze(0).to(self.device)
+            )  # [1,6,4,15]
+            value, (new_h_critic, new_c_critic) = self.critic(critic_state_t, global_feats_t, critic_hidden)
+            new_hidden = (new_h_actor, new_c_actor, new_h_critic, new_c_critic)
+            return (
+                int(action.item()),
+                float(log_prob.item()),
+                float(value.item()),
+                new_hidden,
+            )
+        else:
+            # 只调用 actor，返回 0.0 作为 value，只返回 actor 的 hidden state
+            new_hidden = (new_h_actor, new_c_actor)
+            return (
+                int(action.item()),
+                float(log_prob.item()),
+                0.0,
+                new_hidden,
+            )
 
     def update(self, batch: Dict[str, torch.Tensor]):
         """
         使用 PPO-Clip 算法更新策略与价值函数。
         batch 中的张量在调用前应已搬到 CPU，由本函数负责搬到 device。
         """
-        states = batch["states"]  # [N, C_s, 4, 15]
+        actor_states = batch["actor_states"]  # [N, 3, 4, 15]
+        critic_states = batch["critic_states"]  # [N, 6, 4, 15]
         actions = batch["actions"]  # [N]
         old_log_probs = batch["log_probs"]  # [N]
         returns = batch["returns"]  # [N]
@@ -98,7 +141,7 @@ class PPOAgent:
         legal_masks = batch["legal_masks"]  # [N, A]
         global_feats = batch["global_feats"]  # [N, 5]
 
-        N = states.size(0)
+        N = actor_states.size(0)
         inds = np.arange(N)
 
         for _ in range(self.ppo_epochs):
@@ -107,7 +150,8 @@ class PPOAgent:
                 end = start + self.batch_size
                 mb_inds = inds[start:end]
 
-                mb_states = states[mb_inds].to(self.device)
+                mb_actor_states = actor_states[mb_inds].to(self.device)
+                mb_critic_states = critic_states[mb_inds].to(self.device)
                 mb_actions = actions[mb_inds].to(self.device)
                 mb_old_log_probs = old_log_probs[mb_inds].to(self.device)
                 mb_returns = returns[mb_inds].to(self.device)
@@ -115,7 +159,9 @@ class PPOAgent:
                 mb_legal_masks = legal_masks[mb_inds].to(self.device)
                 mb_global_feats = global_feats[mb_inds].to(self.device)
 
-                logits, values, _ = self.net(mb_states, mb_global_feats, None)
+                # 分别调用 Actor 和 Critic
+                logits, _ = self.actor(mb_actor_states, mb_global_feats, None)
+                values, _ = self.critic(mb_critic_states, mb_global_feats, None)
 
                 # mask 非法动作
                 logits_masked = logits.clone()
@@ -139,7 +185,9 @@ class PPOAgent:
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.net.parameters(), self.max_grad_norm)
+                # 对两个网络的参数进行梯度裁剪
+                params = list(self.actor.parameters()) + list(self.critic.parameters())
+                nn.utils.clip_grad_norm_(params, self.max_grad_norm)
                 self.optimizer.step()
 
     def save_checkpoint(self, filepath: str, episode: int, best_reward: float = None):
@@ -148,7 +196,8 @@ class PPOAgent:
         """
         checkpoint = {
             "episode": episode,
-            "model_state_dict": self.net.state_dict(),
+            "actor_state_dict": self.actor.state_dict(),
+            "critic_state_dict": self.critic.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "best_reward": best_reward,
         }
@@ -160,7 +209,8 @@ class PPOAgent:
         返回：episode, best_reward
         """
         checkpoint = torch.load(filepath, map_location=device)
-        self.net.load_state_dict(checkpoint["model_state_dict"])
+        self.actor.load_state_dict(checkpoint["actor_state_dict"])
+        self.critic.load_state_dict(checkpoint["critic_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         episode = checkpoint.get("episode", 0)
         best_reward = checkpoint.get("best_reward", None)

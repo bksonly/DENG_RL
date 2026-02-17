@@ -12,30 +12,40 @@ from env.core_env import GanDengYanEnv
 class VectorEnv:
     """
     串行 VectorEnv，实现统一的 reset / step 接口。
+    支持混合对手策略：每个环境可以有不同的对手策略。
     """
 
-    def __init__(self, num_envs: int, opponent_agent=None):
+    def __init__(self, num_envs: int, opponent_agents=None, opponent_strategy_types=None):
+        """
+        opponent_agents: List[Optional[PPOAgent]] - 每个环境的对手agent，None表示贪心策略
+        opponent_strategy_types: List[str] - 每个环境的对手策略类型（用于记录）
+        """
         self.num_envs = num_envs
-        self.opponent_agent = opponent_agent
+        self.opponent_agents = opponent_agents if opponent_agents is not None else [None] * num_envs
+        self.opponent_strategy_types = opponent_strategy_types if opponent_strategy_types is not None else ["greedy"] * num_envs
+        
         # 为每个环境的每个对手维护 hidden state
         self.opponent_hidden_states = None
-        if opponent_agent is not None:
+        if any(agent is not None for agent in self.opponent_agents):
             self.opponent_hidden_states = [[None for _ in range(3)] for _ in range(num_envs)]  # 3个对手
         
         self.envs = []
         for env_idx in range(num_envs):
+            opp_agent = self.opponent_agents[env_idx]
             opp_hidden = self.opponent_hidden_states[env_idx] if self.opponent_hidden_states is not None else None
-            env = GanDengYanEnv(opponent_agent=opponent_agent, opponent_hidden_states=opp_hidden)
+            env = GanDengYanEnv(opponent_agent=opp_agent, opponent_hidden_states=opp_hidden)
             self.envs.append(env)
     
-    def set_opponent_agent(self, opponent_agent):
-        """设置对手策略（用于切换自对弈）"""
-        self.opponent_agent = opponent_agent
-        for env in self.envs:
-            env.opponent_agent = opponent_agent
-        if opponent_agent is not None and self.opponent_hidden_states is None:
+    def set_opponent_agents(self, opponent_agents: List, opponent_strategy_types: List[str]):
+        """设置每个环境的对手策略"""
+        self.opponent_agents = opponent_agents
+        self.opponent_strategy_types = opponent_strategy_types
+        for env_idx, env in enumerate(self.envs):
+            env.opponent_agent = opponent_agents[env_idx]
+        if any(agent is not None for agent in opponent_agents) and self.opponent_hidden_states is None:
             self.opponent_hidden_states = [[None for _ in range(3)] for _ in range(self.num_envs)]
-            for env_idx, env in enumerate(self.envs):
+        for env_idx, env in enumerate(self.envs):
+            if self.opponent_hidden_states is not None:
                 env.opponent_hidden_states = self.opponent_hidden_states[env_idx]
 
     def reset(self) -> np.ndarray:

@@ -72,6 +72,57 @@ def build_state(
     return state
 
 
+def build_state_for_critic(
+    agent_id: int,
+    hands: np.ndarray,
+    num_players: int,
+    graveyard: np.ndarray,
+    last_move_cards: Optional[np.ndarray],
+    last_move_player: Optional[int],
+    current_player: int,
+    must_play: bool,
+    has_active_last_move: bool,
+) -> np.ndarray:
+    """
+    为Critic构建包含所有玩家手牌的状态 [6, 4, 15]。
+    
+    通道顺序：
+      0: 我的手牌
+      1-3: 三个对手的手牌（按相对位置：左家、对家、右家）
+      4: 墓地（全局已出牌）
+      5: 当前必须管的牌（target）
+    """
+    C_s = 6
+    state = np.zeros((C_s, 4, NUM_RANKS), dtype=np.float32)
+    
+    # Channel 0: 我的手牌
+    my_hand = hands[agent_id]
+    state[0] = encode_counts_to_matrix(my_hand)
+    
+    # Channel 1-3: 三个对手的手牌（按相对位置：左家、对家、右家）
+    # 相对位置映射：1 -> 左家, 2 -> 对家, 3 -> 右家
+    rel_pos_to_channel = {1: 1, 2: 2, 3: 3}
+    for pid in range(num_players):
+        if pid == agent_id:
+            continue
+        rel = (pid - agent_id) % num_players
+        channel = rel_pos_to_channel.get(rel, None)
+        if channel is not None:
+            opp_hand = hands[pid]
+            state[channel] = encode_counts_to_matrix(opp_hand)
+    
+    # Channel 4: 墓地（全局已出牌）
+    state[4] = encode_counts_to_matrix(graveyard)
+    
+    # Channel 5: 当前必须管的牌（target）
+    if last_move_cards is not None and current_player != last_move_player:
+        state[5] = encode_counts_to_matrix(last_move_cards)
+    else:
+        state[5] = 0.0
+    
+    return state
+
+
 def build_global_features(
     agent_id: int,
     hands: np.ndarray,
