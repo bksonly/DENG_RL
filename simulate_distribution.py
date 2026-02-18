@@ -1,7 +1,8 @@
 import argparse
+import multiprocessing
 import os
 import random
-from typing import List
+from typing import List, Tuple, Union
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,6 +15,23 @@ from test_gdy import greedy_action_for_player
 
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# 进程局部存储：每个 worker 进程只加载一次模型
+_worker_ppo_agent = None
+_worker_checkpoint_path = None
+_worker_device_str = None
+
+
+def _init_worker(checkpoint_path: str, device_str: str):
+    """
+    进程池初始化函数：在每个 worker 进程启动时调用一次，加载模型。
+    这样可以避免每个 trial 都重复加载模型。
+    """
+    global _worker_ppo_agent, _worker_checkpoint_path, _worker_device_str
+    _worker_checkpoint_path = checkpoint_path
+    _worker_device_str = device_str
+    device = torch.device(device_str)
+    _worker_ppo_agent = load_ppo_agent(checkpoint_path, device)
 
 
 def load_ppo_agent(checkpoint_path: str, device: torch.device) -> PPOAgent:
@@ -93,11 +111,92 @@ def run_single_game(env: GanDengYanEnv) -> np.ndarray:
     return final_rewards
 
 
+def run_single_trial(args: Tuple[int, int, int]) -> np.ndarray:
+    """
+    Worker 函数：在单个进程中运行一个 trial。
+    
+    参数：
+        args: (trial_idx, games_per_trial, base_seed)
+    注意：模型通过进程局部变量 _worker_ppo_agent 共享，避免重复加载。
+    
+    返回：
+        该 trial 的 total_reward，shape = [4]
+    """
+    global _worker_ppo_agent, _worker_device_str
+    trial_idx, games_per_trial, base_seed = args
+    
+    # 为每个 trial 设置独立的随机种子
+    trial_seed = base_seed + trial_idx
+    random.seed(trial_seed)
+    np.random.seed(trial_seed)
+    torch.manual_seed(trial_seed)
+    if _worker_device_str == "cuda" and torch.cuda.is_available():
+        torch.cuda.manual_seed_all(trial_seed)
+    
+    # 使用进程局部存储的 PPO agent（在进程初始化时已加载）
+    if _worker_ppo_agent is None:
+        raise RuntimeError("Worker PPO agent not initialized. This should not happen.")
+    
+    # 复用环境对象，避免重复创建开销
+    # 注意：每个 trial 使用同一个环境对象，但每局游戏前会 reset，所以是安全的
+    env = GanDengYanEnv(opponent_agent=_worker_ppo_agent, opponent_hidden_states=[None, None, None])
+    total_reward = np.zeros(4, dtype=np.float32)
+    
+    for _ in range(games_per_trial):
+        rewards = run_single_game(env)  # shape [4]
+        total_reward += rewards
+    
+    return total_reward
+
+
+def run_trial_batch(args: Tuple[List[int], int, int]) -> List[np.ndarray]:
+    """
+    Worker 函数：在单个进程中批量运行多个 trials，减少进程间通信开销。
+    在 worker 内复用环境对象，避免重复创建开销。
+    
+    参数：
+        args: (trial_indices, games_per_trial, base_seed)
+    
+    返回：
+        该批次所有 trials 的 total_reward 列表，每个元素 shape = [4]
+    """
+    global _worker_ppo_agent, _worker_device_str
+    trial_indices, games_per_trial, base_seed = args
+    
+    # 使用进程局部存储的 PPO agent（在进程初始化时已加载）
+    if _worker_ppo_agent is None:
+        raise RuntimeError("Worker PPO agent not initialized. This should not happen.")
+    
+    # 在 worker 内复用环境对象，避免重复创建开销
+    env = GanDengYanEnv(opponent_agent=_worker_ppo_agent, opponent_hidden_states=[None, None, None])
+    
+    results = []
+    for trial_idx in trial_indices:
+        # 为每个 trial 设置独立的随机种子
+        trial_seed = base_seed + trial_idx
+        random.seed(trial_seed)
+        np.random.seed(trial_seed)
+        torch.manual_seed(trial_seed)
+        if _worker_device_str == "cuda" and torch.cuda.is_available():
+            torch.cuda.manual_seed_all(trial_seed)
+        
+        # 运行 games_per_trial 局游戏（复用环境对象）
+        total_reward = np.zeros(4, dtype=np.float32)
+        for _ in range(games_per_trial):
+            rewards = run_single_game(env)  # shape [4]
+            total_reward += rewards
+        
+        results.append(total_reward)
+    
+    return results
+
+
 def run_trials(
     num_trials: int,
     games_per_trial: int,
     checkpoint_path: str,
     seed: int,
+    num_workers: int = 1,
 ) -> np.ndarray:
     """
     重复 num_trials 次实验，每次实验连续打 games_per_trial 局：
@@ -105,27 +204,78 @@ def run_trials(
     - 其余三家使用 PPO 对手策略（latest.pt）。
     返回：shape = [num_trials, 4] 的 total_reward 数组，
     其中 axis=1 依次对应玩家0/1/2/3在该次试验中的总reward。
+    
+    参数：
+        num_trials: 实验次数
+        games_per_trial: 每次实验的游戏局数
+        checkpoint_path: PPO checkpoint 路径
+        seed: 基础随机种子
+        num_workers: 并行 worker 数量，1 表示串行执行
     """
-    # 全局随机种子
+    # 设置基础随机种子（用于主进程）
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-    ppo_agent = load_ppo_agent(checkpoint_path, DEVICE)
-
-    totals: List[np.ndarray] = []
-
-    # 一个环境对象中，赢家连庄逻辑通过 next_dealer 自动处理
-    for _ in tqdm(range(num_trials), desc="Simulating trials"):
+    
+    # 确定设备（多进程时使用 CPU 更稳定，单进程可以使用 CUDA）
+    if num_workers == 1:
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    else:
+        # 多进程时使用 CPU，避免 CUDA 多进程问题
+        device_str = "cpu"
+    
+    # 串行执行（向后兼容）
+    if num_workers == 1:
+        ppo_agent = load_ppo_agent(checkpoint_path, DEVICE)
+        totals: List[np.ndarray] = []
+        
+        # 复用环境对象，避免重复创建开销
+        # 一个环境对象中，赢家连庄逻辑通过 next_dealer 自动处理
         env = GanDengYanEnv(opponent_agent=ppo_agent, opponent_hidden_states=[None, None, None])
-        total_reward = np.zeros(4, dtype=np.float32)
-        for _ in range(games_per_trial):
-            rewards = run_single_game(env)  # shape [4]
-            total_reward += rewards
-        totals.append(total_reward)
-
+        for _ in tqdm(range(num_trials), desc="Simulating trials"):
+            total_reward = np.zeros(4, dtype=np.float32)
+            for _ in range(games_per_trial):
+                rewards = run_single_game(env)  # shape [4]
+                total_reward += rewards
+            totals.append(total_reward)
+        
+        return np.stack(totals, axis=0).astype(np.float32)
+    
+    # 多进程并行执行 - 使用真正的批量处理
+    # 将 trials 分成批次，每个 worker 一次处理一个批次（包含多个 trials）
+    # 这样可以减少进程间通信次数，并在 worker 内复用环境对象
+    
+    # 计算批量大小：每个 worker 处理约 4-8 批，平衡通信开销和负载均衡
+    batch_size = max(10, num_trials // (num_workers * 20))  # 每个 worker 处理约 6 批
+    
+    # 将 trials 分成批次
+    trial_batches = []
+    for i in range(0, num_trials, batch_size):
+        batch_indices = list(range(i, min(i + batch_size, num_trials)))
+        trial_batches.append((batch_indices, games_per_trial, seed))
+    
+    print(f"Using batch processing: {len(trial_batches)} batches, {batch_size} trials per batch")
+    
+    # 使用进程池并行执行，initializer 确保每个进程只加载一次模型
+    with multiprocessing.Pool(
+        processes=num_workers,
+        initializer=_init_worker,
+        initargs=(checkpoint_path, device_str)
+    ) as pool:
+        # 使用 imap 以便 tqdm 能够实时显示进度
+        batch_results = list(tqdm(
+            pool.imap(run_trial_batch, trial_batches),
+            total=len(trial_batches),
+            desc="Simulating trials"
+        ))
+    
+    # 展平批次结果
+    totals = []
+    for batch_result in batch_results:
+        totals.extend(batch_result)
+    
     return np.stack(totals, axis=0).astype(np.float32)
 
 
@@ -232,14 +382,20 @@ def main() -> None:
     parser.add_argument(
         "--out-plot",
         type=str,
-        default="/home/server/Desktop/DENG_RL/eval/sim_total_reward_hist.png",
+        default="/home/server/Desktop/DENG_RL/eval1/sim_total_reward_hist.png",
         help="Output path for histogram figure (default: %(default)s)",
     )
     parser.add_argument(
         "--out-data",
         type=str,
-        default="/home/server/Desktop/DENG_RL/eval/sim_total_reward.npy",
+        default="/home/server/Desktop/DENG_RL/eval1/sim_total_reward.npy",
         help="Output path for raw total_reward numpy array (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers (default: CPU count, use 1 for serial execution)",
     )
 
     args = parser.parse_args()
@@ -249,6 +405,7 @@ def main() -> None:
         games_per_trial=args.games_per_trial,
         checkpoint_path=args.model,
         seed=args.seed,
+        num_workers=args.num_workers,
     )
 
     # 保存原始数据

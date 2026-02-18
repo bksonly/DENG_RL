@@ -380,7 +380,7 @@ class PPOAgent:
         从 checkpoint 加载模型和训练进度。
         返回：episode, best_reward
         """
-        checkpoint = torch.load(filepath, map_location=device)
+        checkpoint = torch.load(filepath, map_location=device, weights_only=False)
         # 由于网络结构可能会迭代（例如移除 Critic LSTM），这里使用 strict=False 提升兼容性。
         self.actor.load_state_dict(checkpoint.get("actor_state_dict", {}), strict=False)
         self.critic.load_state_dict(checkpoint.get("critic_state_dict", {}), strict=False)
